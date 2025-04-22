@@ -191,11 +191,13 @@ class FitWrapped:
 
     def _create_dashboard(self, breakdown):
         """Create a dashboard with all visualizations"""
-        # Setup subplots: 2 cols x 2 rows
+        # bump up spacing and give each row a little extra height
         fig = make_subplots(
             rows=3, cols=2,
             subplot_titles=("Activity Counts", "Activity Distance", "Sleep Trends", "Resting HR Trends"),
-            vertical_spacing=0.1, horizontal_spacing=0.1
+            vertical_spacing=0.15,    # was 0.1
+            horizontal_spacing=0.15,  # was 0.1
+            row_heights=[0.3, 0.3, 0.3]
         )
         # Activity Count Bar
         fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['count'], name='Count'), row=1, col=1)
@@ -235,7 +237,8 @@ class FitWrapped:
         fig.update_layout(
             title_text=f"FitWrapped {self.year} Dashboard",
             template='plotly_white',
-            height=800, width=1200,
+            height=900, width=1250,
+            margin=dict(l=70, r=70, t=100, b=70),  # add more room around the edges
             title_font=dict(size=24), font=dict(size=14),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
         )

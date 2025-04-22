@@ -13,6 +13,7 @@ from rich import box
 from rich.table import Table
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+from scipy.stats import gaussian_kde
 
 class FitWrapped:
     def __init__(self, year=2025):
@@ -30,7 +31,7 @@ class FitWrapped:
         # Load RHR and Sleep data
         self.rhr_data = self._load_rhr_data()
         self.sleep_data = self._load_sleep_data()
-        
+        self.run_sleep_data = self._get_run_sleep()
     def _load_rhr_data(self):
         """Load and process RHR data from JSON files"""
         rhr_data = []
@@ -68,7 +69,7 @@ class FitWrapped:
         if not df.empty:
             df['date'] = pd.to_datetime(df['date'])
             df['sleep_hours'] = df['deepSleepSeconds'] / 3600
-            df['rolling_sleep'] = df['sleep_hours'].rolling(window=7, min_periods=1).mean()
+            df['rolling_sleep'] = df['sleep_hours'].rolling(window=10, min_periods=1).mean()
         return df
 
     def _get_activity_breakdown(self):
@@ -79,8 +80,12 @@ class FitWrapped:
             COUNT(*) AS count,
             SUM(distance) AS total_distance,
             AVG(distance) AS avg_distance,
-            SUM(elapsed_time)/60.0 AS total_duration_minutes,
-            AVG(elapsed_time)/60.0 AS avg_duration_minutes,
+            SUM(CAST(strftime('%H', elapsed_time) AS INTEGER) * 60 +
+            CAST(strftime('%M', elapsed_time) AS INTEGER) +
+            CAST(strftime('%S', elapsed_time) AS INTEGER) / 60.0) AS total_duration_minutes,
+            AVG(CAST(strftime('%H', elapsed_time) AS INTEGER) * 60 +
+            CAST(strftime('%M', elapsed_time) AS INTEGER) +
+            CAST(strftime('%S', elapsed_time) AS INTEGER) / 60.0) as avg_duration_minutes,
             AVG(avg_hr) AS avg_heart_rate
         FROM activities
         WHERE strftime('%Y', start_time) = ?
@@ -89,6 +94,22 @@ class FitWrapped:
         """
         df = pd.read_sql_query(query, self.activities_db, params=(str(self.year),))
         return df
+    
+    def _get_run_sleep(self):
+        run_times_df = pd.read_sql_query("""
+        SELECT start_time
+        FROM activities
+        WHERE sport = 'running' AND strftime('%Y', start_time) = ?
+        """, self.activities_db, params=(str(self.year),))
+
+        # Convert to datetime
+        run_times_df['start_time'] = pd.to_datetime(run_times_df['start_time'])
+
+        # Extract date and hour (for plotting)
+        run_times_df['date'] = run_times_df['start_time'].dt.date
+        run_times_df['hour'] = run_times_df['start_time'].dt.hour + run_times_df['start_time'].dt.minute / 60
+        
+        return run_times_df
 
     def _get_sleep_insights(self):
         """Analyze sleep patterns and quality"""
@@ -156,8 +177,8 @@ class FitWrapped:
                 table.add_row(
                     row['activity_type'],
                     str(int(row['count'])),
-                    f"{row['total_distance']/1000:.1f}",
-                    f"{row['avg_distance']/1000:.1f}",
+                    f"{row['total_distance']:.1f}",
+                    f"{row['avg_distance']:.1f}",
                     f"{row['total_duration_minutes']/60:.1f}",
                     f"{row['avg_duration_minutes']:.1f}",
                     f"{row['avg_heart_rate']:.0f}"
@@ -172,30 +193,44 @@ class FitWrapped:
         """Create a dashboard with all visualizations"""
         # Setup subplots: 2 cols x 2 rows
         fig = make_subplots(
-            rows=2, cols=2,
+            rows=3, cols=2,
             subplot_titles=("Activity Counts", "Activity Distance", "Sleep Trends", "Resting HR Trends"),
             vertical_spacing=0.1, horizontal_spacing=0.1
         )
         # Activity Count Bar
         fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['count'], name='Count'), row=1, col=1)
         # Activity Distance Bar (km)
-        fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['total_distance']/1000, name='Total Dist (km)'), row=1, col=2)
+        fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['total_distance'], name='Total Dist (km)'), row=1, col=2)
         
         # Sleep Trends
         if not self.sleep_data.empty:
-            fig.add_trace(go.Scatter(x=self.sleep_data['date'], y=self.sleep_data['sleep_hours'], mode='markers', name='Deep Sleep'), row=2, col=1)
-            fig.add_trace(go.Scatter(x=self.sleep_data['date'], y=self.sleep_data['rolling_sleep'], mode='lines', name='7d Avg Sleep'), row=2, col=1)
+            self.sleep_data = self.sleep_data.sort_values(by='date')
+            fig.add_trace(go.Scatter(x=self.sleep_data['date'], y=self.sleep_data['rolling_sleep'], mode='lines', name='10d Avg Sleep'), row=2, col=1)
             avg = self.sleep_data['sleep_hours'].mean()
             fig.add_hline(y=avg, line_dash='dash', annotation_text=f"Avg {avg:.1f}h", row=2, col=1)
         
         # RHR Trends
         if not self.rhr_data.empty:
+            self.rhr_data = self.rhr_data.sort_values('date')
             self.rhr_data['rolling'] = self.rhr_data['value'].rolling(7, min_periods=1).mean()
             fig.add_trace(go.Scatter(x=self.rhr_data['date'], y=self.rhr_data['value'], mode='markers', name='Daily RHR'), row=2, col=2)
             fig.add_trace(go.Scatter(x=self.rhr_data['date'], y=self.rhr_data['rolling'], mode='lines', name='7d Avg RHR'), row=2, col=2)
             avg_r = self.rhr_data['value'].mean()
             fig.add_hline(y=avg_r, line_dash='dash', annotation_text=f"Avg {avg_r:.0f} bpm", row=2, col=2)
-        
+            
+        if not self.run_sleep_data.empty:
+            fig.add_trace(go.Scatter(
+            x=self.run_sleep_data['date'], 
+            y=self.run_sleep_data['hour'], 
+            mode='markers',
+            marker=dict(size=8, color='green'),
+            name='Running Time'
+            ), row=3, col=1)
+
+            fig.update_yaxes(title_text='Hour of Day (0–24)', range=[0, 24], row=3, col=1)
+            fig.update_xaxes(title_text='Date', row=3, col=1)
+
+                    
         # Layout improvements
         fig.update_layout(
             title_text=f"FitWrapped {self.year} Dashboard",

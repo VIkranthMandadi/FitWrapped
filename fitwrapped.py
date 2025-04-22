@@ -13,7 +13,12 @@ from rich import box
 from rich.table import Table
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-from scipy.stats import gaussian_kde
+import re
+import time
+import geopandas as gpd
+from shapely.geometry import Point
+import us
+import plotly.express as px
 
 class FitWrapped:
     def __init__(self, year=2025):
@@ -32,6 +37,7 @@ class FitWrapped:
         self.rhr_data = self._load_rhr_data()
         self.sleep_data = self._load_sleep_data()
         self.run_sleep_data = self._get_run_sleep()
+        self.location_data = self._get_coords()
     def _load_rhr_data(self):
         """Load and process RHR data from JSON files"""
         rhr_data = []
@@ -52,6 +58,39 @@ class FitWrapped:
         if not df.empty:
             df['date'] = pd.to_datetime(df['date'])
         return df
+    
+    def _get_coords(self):
+        query = "SELECT * from steps_activities_view WHERE strftime('%Y', start_time) = ?"
+        df = pd.read_sql_query(query, self.activities_db,  params=(str(self.year),))
+        states = gpd.read_file("https://eric.clst.org/assets/wiki/uploads/Stuff/gz_2010_us_040_00_500k.json")
+
+        
+        def extract_coords(url):
+            if not isinstance(url, str):
+                return None, None
+            match = re.search(r'q=([-\d\.]+),([-\d\.]+)', url)
+            if match:
+                return float(match.group(1)), float(match.group(2))
+            return None, None
+        
+        df['lat'], df['lon'] = zip(*df['start_loc'].map(extract_coords))
+        df['geometry'] = df.apply(lambda row: Point(row['lon'], row['lat']), axis=1)
+        
+        gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
+        states = states[['NAME', 'geometry']]
+
+        # Join: assign each run to a state polygon if it's within one
+        gdf_with_state = gpd.sjoin(gdf, states, how='left', predicate='within')
+
+        # Rename the column for clarity
+        gdf_with_state = gdf_with_state.rename(columns={'NAME': 'state'})
+        
+        state_counts = gdf_with_state['state'].value_counts().reset_index()
+        state_counts.columns = ['state', 'count']
+        return state_counts
+        
+
+                
 
     def _load_sleep_data(self):
         """Load and process sleep data from JSON files"""
@@ -194,8 +233,13 @@ class FitWrapped:
         # Setup subplots: 2 cols x 2 rows
         fig = make_subplots(
             rows=3, cols=2,
+            specs=[
+                [{}, {}],         # row 1
+                [{}, {}],         # row 2
+                [{}, {'type': 'choropleth'}]  # row 3 — make (3,2) a choropleth cell
+            ],
             subplot_titles=("Activity Counts", "Activity Distance", "Sleep Trends", "Resting HR Trends"),
-            vertical_spacing=0.1, horizontal_spacing=0.1
+            vertical_spacing=0.2, horizontal_spacing=0.2
         )
         # Activity Count Bar
         fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['count'], name='Count'), row=1, col=1)
@@ -229,6 +273,43 @@ class FitWrapped:
 
             fig.update_yaxes(title_text='Hour of Day (0–24)', range=[0, 24], row=3, col=1)
             fig.update_xaxes(title_text='Date', row=3, col=1)
+            
+        if not self.location_data.empty:
+            self.location_data['state'] = self.location_data['state'].map(
+            lambda x: us.states.lookup(x).abbr if pd.notna(x) and us.states.lookup(x) else None
+            )            
+            
+            all_states = pd.DataFrame({
+            'state': [s.abbr for s in us.states.STATES]
+            })
+
+            # Merge with your real counts
+            full_data = all_states.merge(self.location_data, on='state', how='left')
+            full_data['count'] = full_data['count'].fillna(0) 
+            choropleth_trace = go.Choropleth(
+                locations=full_data['state'],     # Should be 2-letter codes (e.g., 'CA', 'WI')
+                locationmode='USA-states',
+                z=full_data['count'],
+                zmin=0,
+                text=full_data['state'] + ': ' + full_data['count'].astype(str) + ' runs',
+                colorscale='bugn',
+                hoverinfo='text+z',
+                showscale=False
+            )
+
+            
+            fig.add_trace(choropleth_trace, row=3, col=2)
+
+            fig.update_geos(
+            scope='usa',
+            showlakes=True,
+            lakecolor='lightgray',
+            bgcolor='rgba(0,0,0,0)',
+            )
+
+            fig.update_layout(
+                plot_bgcolor='white',
+            )
 
                     
         # Layout improvements

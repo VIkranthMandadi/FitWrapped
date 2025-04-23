@@ -38,6 +38,7 @@ class FitWrapped:
         self.sleep_data = self._load_sleep_data()
         self.run_sleep_data = self._get_run_sleep()
         self.location_data = self._get_coords()
+
     def _load_rhr_data(self):
         """Load and process RHR data from JSON files"""
         rhr_data = []
@@ -64,11 +65,10 @@ class FitWrapped:
         df = pd.read_sql_query(query, self.activities_db,  params=(str(self.year),))
         states = gpd.read_file("https://eric.clst.org/assets/wiki/uploads/Stuff/gz_2010_us_040_00_500k.json")
 
-        
         def extract_coords(url):
             if not isinstance(url, str):
                 return None, None
-            match = re.search(r'q=([-\d\.]+),([-\d\.]+)', url)
+            match = re.search(r'q=([\-\d\.]+),([\-\d\.]+)', url)
             if match:
                 return float(match.group(1)), float(match.group(2))
             return None, None
@@ -88,10 +88,7 @@ class FitWrapped:
         state_counts = gdf_with_state['state'].value_counts().reset_index()
         state_counts.columns = ['state', 'count']
         return state_counts
-        
-
                 
-
     def _load_sleep_data(self):
         """Load and process sleep data from JSON files"""
         sleep_data = []
@@ -134,6 +131,25 @@ class FitWrapped:
         df = pd.read_sql_query(query, self.activities_db, params=(str(self.year),))
         return df
     
+    def _get_best_activities(self, top_n=5):
+        """Fetch top activities by distance"""
+        query = """
+        SELECT
+            name,
+            sport,
+            ROUND(distance,1) AS distance,
+            (CAST(strftime('%H', elapsed_time) AS INTEGER) * 60 +
+             CAST(strftime('%M', elapsed_time) AS INTEGER) +
+             CAST(strftime('%S', elapsed_time) AS INTEGER) / 60.0) AS duration_minutes,
+            calories
+        FROM activities
+        WHERE strftime('%Y', start_time) = ?
+        ORDER BY distance DESC
+        LIMIT ?
+        """
+        df = pd.read_sql_query(query, self.activities_db, params=(str(self.year), top_n))
+        return df
+
     def _get_run_sleep(self):
         run_times_df = pd.read_sql_query("""
         SELECT start_time
@@ -141,51 +157,40 @@ class FitWrapped:
         WHERE sport = 'running' AND strftime('%Y', start_time) = ?
         """, self.activities_db, params=(str(self.year),))
 
-        # Convert to datetime
         run_times_df['start_time'] = pd.to_datetime(run_times_df['start_time'])
-
-        # Extract date and hour (for plotting)
         run_times_df['date'] = run_times_df['start_time'].dt.date
         run_times_df['hour'] = run_times_df['start_time'].dt.hour + run_times_df['start_time'].dt.minute / 60
-        
         return run_times_df
 
     def _get_sleep_insights(self):
-        """Analyze sleep patterns and quality"""
-        sleep = self.sleep_data
-        if sleep.empty:
+        if self.sleep_data.empty:
             return {}
-        sleep_stats = {
+        sleep = self.sleep_data
+        return {
             'average_sleep_duration': sleep['sleep_hours'].mean(),
             'best_sleep_date': sleep.loc[sleep['sleep_hours'].idxmax(), 'date'].date(),
             'total_sleep_hours': sleep['sleep_hours'].sum()
         }
-        return sleep_stats
-    
+
     def _get_heart_rate_insights(self):
-        """Analyze heart rate patterns"""
-        rhr = self.rhr_data
-        if rhr.empty:
+        if self.rhr_data.empty:
             return {}
-        rhr_stats = {
+        rhr = self.rhr_data
+        return {
             'average_rhr': rhr['value'].mean(),
             'lowest_rhr': rhr['value'].min(),
             'lowest_rhr_date': rhr.loc[rhr['value'].idxmin(), 'date'].date()
         }
-        return rhr_stats
-    
+
     def generate_wrapped(self):
-        """Generate and display the FitWrapped report"""
         self.console.print("\n[bold magenta]🎉 Welcome to FitWrapped 2025! 🎉[/bold magenta]\n", justify="center")
-        
-        # Pull analytics
         breakdown = self._get_activity_breakdown()
         sleep_insights = self._get_sleep_insights()
         heart_rate_insights = self._get_heart_rate_insights()
+        best_activities = self._get_best_activities()
         total_activities = breakdown['count'].sum()
         most_common = breakdown.iloc[0]['activity_type'] if not breakdown.empty else 'N/A'
-        
-        # Summary Panel
+
         panel_text = Text.from_markup(f"""
 [bold green]Year in Fitness[/bold green]
 🏃 Total Activities: {total_activities}
@@ -201,13 +206,12 @@ class FitWrapped:
 💓 Lowest RHR: {heart_rate_insights.get('lowest_rhr_date', 'N/A')} @ {heart_rate_insights.get('lowest_rhr', 0):.0f} bpm
 """, justify="left")
         self.console.print(Panel(panel_text, title="Your Fitness Summary", box=box.ROUNDED, padding=(1,2)))
-        
-        # Detailed Breakdown Table
+
         if not breakdown.empty:
             table = Table(title="Activity Breakdown", box=box.SIMPLE_HEAVY)
             for col, header in [
                 ('activity_type', 'Activity'), ('count', 'Count'),
-                ('total_distance', 'Total Dist (km)'), ('avg_distance', 'Avg Dist (km)'),
+                ('total_distance', 'Total Dist (mi)'), ('avg_distance', 'Avg Dist (mi)'),
                 ('total_duration_minutes', 'Total Dur (h)'), ('avg_duration_minutes', 'Avg Dur (min)'),
                 ('avg_heart_rate', 'Avg HR')]:
                 table.add_column(header, justify="right" if col != 'activity_type' else "left")
@@ -223,103 +227,79 @@ class FitWrapped:
                     f"{row['avg_heart_rate']:.0f}"
                 )
             self.console.print(table)
-        
-        # Generate dashboard HTML
-        self._create_dashboard(breakdown)
+
+        self._create_dashboard(breakdown, best_activities)
         self.console.print("\nDashboard saved as [bold]fitness_dashboard.html[/bold]")
 
-    def _create_dashboard(self, breakdown):
-        """Create a dashboard with all visualizations"""
-        # bump up spacing and give each row a little extra height
+    def _create_dashboard(self, breakdown, best_activities):
         fig = make_subplots(
-            rows=3, cols=2,
+            rows=4, cols=2,
             specs=[
-                [{}, {}],         # row 1
-                [{}, {}],         # row 2
-                [{}, {'type': 'choropleth'}]  # row 3 — make (3,2) a choropleth cell
+                [{}, {}],
+                [{}, {}],
+                [{}, {'type': 'choropleth'}],
+                [{'type': 'table', 'colspan': 2}, None]
             ],
-            subplot_titles=("Activity Counts", "Activity Distance", "Sleep Trends", "Resting HR Trends"),
-            vertical_spacing=0.15,    # was 0.1
-            horizontal_spacing=0.15,  # was 0.1
-            row_heights=[0.3, 0.3, 0.3]
+            subplot_titles=(
+                "Activity Counts", "Activity Distance",
+                "Sleep Trends", "Resting HR Trends",
+                "Running Times", "State Distribution",
+                "Best Activities", ""
+            ),
+            row_heights=[0.25, 0.25, 0.25, 0.25],
+            vertical_spacing=0.12,
+            horizontal_spacing=0.1
         )
-        # Activity Count Bar
+        # Row 1
         fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['count'], name='Count'), row=1, col=1)
-        # Activity Distance Bar (km)
-        fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['total_distance'], name='Total Dist (km)'), row=1, col=2)
-        
-        # Sleep Trends
+        fig.add_trace(go.Bar(x=breakdown['activity_type'], y=breakdown['total_distance'], name='Total Dist (mi)'), row=1, col=2)
+        # Row 2
         if not self.sleep_data.empty:
-            self.sleep_data = self.sleep_data.sort_values(by='date')
-            fig.add_trace(go.Scatter(x=self.sleep_data['date'], y=self.sleep_data['rolling_sleep'], mode='lines', name='10d Avg Sleep'), row=2, col=1)
-            avg = self.sleep_data['sleep_hours'].mean()
-            fig.add_hline(y=avg, line_dash='dash', annotation_text=f"Avg {avg:.1f}h", row=2, col=1)
-        
-        # RHR Trends
+            sleep_df = self.sleep_data.sort_values('date')
+            fig.add_trace(go.Scatter(x=sleep_df['date'], y=sleep_df['rolling_sleep'], mode='lines', name='10d Avg Sleep'), row=2, col=1)
+            avg_sleep = sleep_df['sleep_hours'].mean()
+            fig.add_hline(y=avg_sleep, line_dash='dash', annotation_text=f"Avg {avg_sleep:.1f}h", row=2, col=1)
         if not self.rhr_data.empty:
-            self.rhr_data = self.rhr_data.sort_values('date')
-            self.rhr_data['rolling'] = self.rhr_data['value'].rolling(7, min_periods=1).mean()
-            fig.add_trace(go.Scatter(x=self.rhr_data['date'], y=self.rhr_data['value'], mode='markers', name='Daily RHR'), row=2, col=2)
-            fig.add_trace(go.Scatter(x=self.rhr_data['date'], y=self.rhr_data['rolling'], mode='lines', name='7d Avg RHR'), row=2, col=2)
-            avg_r = self.rhr_data['value'].mean()
+            rhr_df = self.rhr_data.sort_values('date')
+            rhr_df['rolling'] = rhr_df['value'].rolling(7, min_periods=1).mean()
+            fig.add_trace(go.Scatter(x=rhr_df['date'], y=rhr_df['value'], mode='markers', name='Daily RHR'), row=2, col=2)
+            fig.add_trace(go.Scatter(x=rhr_df['date'], y=rhr_df['rolling'], mode='lines', name='7d Avg RHR'), row=2, col=2)
+            avg_r = rhr_df['value'].mean()
             fig.add_hline(y=avg_r, line_dash='dash', annotation_text=f"Avg {avg_r:.0f} bpm", row=2, col=2)
-            
+        # Row 3
         if not self.run_sleep_data.empty:
             fig.add_trace(go.Scatter(
-            x=self.run_sleep_data['date'], 
-            y=self.run_sleep_data['hour'], 
-            mode='markers',
-            marker=dict(size=8, color='green'),
-            name='Running Time'
+                x=self.run_sleep_data['date'],
+                y=self.run_sleep_data['hour'],
+                mode='markers',
+                marker=dict(size=8),
+                name='Running Time'
             ), row=3, col=1)
-
-            fig.update_yaxes(title_text='Hour of Day (0–24)', range=[0, 24], row=3, col=1)
-            fig.update_xaxes(title_text='Date', row=3, col=1)
-            
+            fig.update_yaxes(title_text='Hour of Day', range=[0,24], row=3, col=1)
         if not self.location_data.empty:
-            self.location_data['state'] = self.location_data['state'].map(
-            lambda x: us.states.lookup(x).abbr if pd.notna(x) and us.states.lookup(x) else None
-            )            
-            
-            all_states = pd.DataFrame({
-            'state': [s.abbr for s in us.states.STATES]
-            })
-
-            # Merge with your real counts
-            full_data = all_states.merge(self.location_data, on='state', how='left')
-            full_data['count'] = full_data['count'].fillna(0) 
-            choropleth_trace = go.Choropleth(
-                locations=full_data['state'],     # Should be 2-letter codes (e.g., 'CA', 'WI')
-                locationmode='USA-states',
-                z=full_data['count'],
-                zmin=0,
-                text=full_data['state'] + ': ' + full_data['count'].astype(str) + ' runs',
-                colorscale='bugn',
-                hoverinfo='text+z',
-                showscale=False
+            loc = self.location_data.copy()
+            loc['state'] = loc['state'].map(lambda x: us.states.lookup(x).abbr if pd.notna(x) else None)
+            all_states = pd.DataFrame({'state':[s.abbr for s in us.states.STATES]})
+            full_data = all_states.merge(loc, on='state', how='left').fillna(0)
+            choropleth = go.Choropleth(
+                locations=full_data['state'], locationmode='USA-states', z=full_data['count'], showscale=False
             )
-
-            
-            fig.add_trace(choropleth_trace, row=3, col=2)
-
-            fig.update_geos(
-            scope='usa',
-            showlakes=True,
-            lakecolor='lightgray',
-            bgcolor='rgba(0,0,0,0)',
-            )
-
-            fig.update_layout(
-                plot_bgcolor='white',
-            )
-
-                    
-        # Layout improvements
+            fig.add_trace(choropleth, row=3, col=2)
+            fig.update_geos(scope='usa', showlakes=True, lakecolor='lightgray', bgcolor='rgba(0,0,0,0)')
+        # Row 4: Best Activities Table
+        if not best_activities.empty:
+            fig.add_trace(go.Table(
+                header=dict(values=["Name","Sport","Distance (mi)","Duration (min)","Calories"]),
+                cells=dict(values=[
+                    best_activities['name'], best_activities['sport'],
+                    best_activities['distance'], best_activities['duration_minutes'], best_activities['calories']
+                ])
+            ), row=4, col=1)
+        # Layout
         fig.update_layout(
             title_text=f"FitWrapped {self.year} Dashboard",
-            template='plotly_white',
-            height=900, width=1250,
-            margin=dict(l=70, r=70, t=100, b=70),  # add more room around the edges
+            template='plotly_white', height=1000, width=1250,
+            margin=dict(l=50, r=50, t=100, b=50),
             title_font=dict(size=24), font=dict(size=14),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
         )
